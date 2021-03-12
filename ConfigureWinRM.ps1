@@ -3,103 +3,86 @@
 #                                                                                                                               #
 #  Description : Configures the WinRM on a local machine                                                                        #
 #                                                                                                                               #
-#  Arguments   : HostName, specifies the ipaddress or FQDN of machine                                                           #
+#  Arguments   : HostName, specifies the FQDN of machine or domain                                                           #
 #################################################################################################################################
 
 param
 (
-    [string] $hostname,
-    [string] $protocol
+    [Parameter(Mandatory = $true)]
+    [string] $HostName
 )
 
 #################################################################################################################################
 #                                             Helper Functions                                                                  #
 #################################################################################################################################
 
-$ErrorActionPreference="Stop"
-$winrmHttpPort=5985
-$winrmHttpsPort=5986
-
-$helpMsg = "Usage:
-            To configure WinRM over Https:
-                ./ConfigureWinRM.ps1 <fqdn\ipaddress> https
-            To configure WinRM over Http:
-                ./ConfigureWinRM.ps1 <fqdn\ipaddress> http"
-
-
-function Is-InputValid
-{  
-    $isInputValid = $true
-
-    if(-not $hostname -or ($protocol -ne "http" -and $protocol -ne "https"))
-    {
-        $isInputValid = $false
-    }
-
-    return $isInputValid
-}
-
 function Delete-WinRMListener
 {
-    $config = winrm enumerate winrm/config/listener
-    foreach($conf in $config)
+    try
     {
-        if($conf.Contains("HTTPS"))
+        $config = Winrm enumerate winrm/config/listener
+        foreach($conf in $config)
         {
-            Write-Verbose -Verbose "HTTPS is already configured. Deleting the exisiting configuration."
-
-            winrm delete winrm/config/Listener?Address=*+Transport=HTTPS
-            break
+            if($conf.Contains("HTTPS"))
+            {
+                Write-Verbose "HTTPS is already configured. Deleting the exisiting configuration."
+    
+                winrm delete winrm/config/Listener?Address=*+Transport=HTTPS
+                break
+            }
         }
     }
+    catch
+    {
+        Write-Verbose -Verbose "Exception while deleting the listener: " + $_.Exception.Message
+    }
 }
 
-function Configure-WinRMListener
+function Create-Certificate
 {
-    Write-Verbose -Verbose "Configuring the WinRM listener for $hostname over $protocol protocol. This operation takes little longer time, please wait..."
+    param(
+        [string]$hostname
+    )
 
-    if($protocol -ne "http")
-    {
-            Configure-WinRMHttpsListener -hostname $hostname -port $winrmHttpsPort
-    }
-    else
-    {
-            Configure-WinRMHttpListener
-    }
-    
-    Write-Verbose -Verbose "Successfully Configured the WinRM listener for $hostname over $protocol protocol" 
-}
+    # makecert ocassionally produces negative serial numbers
+	# which golang tls/crypto <1.6.1 cannot handle
+	# https://github.com/golang/go/issues/8265
+    $serial = Get-Random
+    .\makecert -r -pe -n CN=$hostname -b 01/01/2012 -e 01/01/2022 -eku 1.3.6.1.5.5.7.3.1 -ss my -sr localmachine -sky exchange -sp "Microsoft RSA SChannel Cryptographic Provider" -sy 12 -# $serial 2>&1 | Out-Null
 
-function Configure-WinRMHttpListener
-{
-    winrm delete winrm/config/Listener?Address=*+Transport=HTTP
-    winrm create winrm/config/Listener?Address=*+Transport=HTTP
+    $thumbprint=(Get-ChildItem cert:\Localmachine\my | Where-Object { $_.Subject -eq "CN=" + $hostname } | Select-Object -Last 1).Thumbprint
+
+    if(-not $thumbprint)
+    {
+        throw "Failed to create the test certificate."
+    }
+
+    return $thumbprint
 }
 
 function Configure-WinRMHttpsListener
 {
+    param([string] $HostName,
+          [string] $port)
+
     # Delete the WinRM Https listener if it is already configured
     Delete-WinRMListener
 
     # Create a test certificate
-    $thumbprint = (Get-ChildItem cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=" + $hostname } | Select-Object -Last 1).Thumbprint
+    $cert = (Get-ChildItem cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=" + $hostname } | Select-Object -Last 1)
+    $thumbprint = $cert.Thumbprint
     if(-not $thumbprint)
     {
-        if(-not (Test-Path -Path .\makecert.exe))
-        {
-            throw "File not found: makecert.exe"
-        }
-
-        .\makecert -r -pe -n CN=$hostname -b 01/01/2012 -e 01/01/2022 -eku 1.3.6.1.5.5.7.3.1 -ss my -sr localmachine -sky exchange -sp "Microsoft RSA SChannel Cryptographic Provider" -sy 12
-        $thumbprint=(Get-ChildItem cert:\Localmachine\my | Where-Object { $_.Subject -eq "CN=" + $hostname } | Select-Object -Last 1).Thumbprint
-
-        if(-not $thumbprint)
-        {
-            throw "Failed to create the test certificate."
-        }
+	    $thumbprint = Create-Certificate -hostname $HostName
     }
-    
-    # Configure WinRM
+    elseif (-not $cert.PrivateKey)
+    {
+        # The private key is missing - could have been sysprepped
+        # Delete the certificate
+        Remove-Item Cert:\LocalMachine\My\$thumbprint -Force
+        $thumbprint = Create-Certificate -hostname $HostName
+    }
+
     $WinrmCreate= "winrm create --% winrm/config/Listener?Address=*+Transport=HTTPS @{Hostname=`"$hostName`";CertificateThumbprint=`"$thumbPrint`"}"
     invoke-expression $WinrmCreate
     winrm set winrm/config/service/auth '@{Basic="true"}'
@@ -107,22 +90,13 @@ function Configure-WinRMHttpsListener
 
 function Add-FirewallException
 {
-    if( $protocol -ne "http")
-    {
-        $port = $winrmHttpsPort
-    }
-    else
-    {
-        $port = $winrmHttpPort
-    }
+    param([string] $port)
 
     # Delete an exisitng rule
-    Write-Verbose -Verbose "Deleting the existing firewall exception for port $port"
-    netsh advfirewall firewall delete rule name="Windows Remote Management (HTTPS-In)" dir=in protocol=TCP localport=$port | Out-Null
+    netsh advfirewall firewall delete rule name="Windows Remote Management (HTTPS-In)" dir=in protocol=TCP localport=$port
 
     # Add a new firewall rule
-    Write-Verbose -Verbose "Adding the firewall exception for port $port"
-    netsh advfirewall firewall add rule name="Windows Remote Management (HTTPS-In)" dir=in action=allow protocol=TCP localport=$port | Out-Null
+    netsh advfirewall firewall add rule name="Windows Remote Management (HTTPS-In)" dir=in action=allow protocol=TCP localport=$port
 }
 
 
@@ -130,34 +104,17 @@ function Add-FirewallException
 #                                              Configure WinRM                                                                  #
 #################################################################################################################################
 
-# Validate script arguments
-if(-not (Is-InputValid))
-{
-    Write-Warning "Invalid Argument exception:"
-    Write-Host $helpMsg
-
-    return
-}
-
-netsh advfirewall firewall set rule group="File and Printer Sharing" new enable=yes
-winrm quickconfig
+$winrmHttpsPort=5986
 
 # The default MaxEnvelopeSizekb on Windows Server is 500 Kb which is very less. It needs to be at 8192 Kb. The small envelop size if not changed
 # results in WS-Management service responding with error that the request size exceeded the configured MaxEnvelopeSize quota.
 winrm set winrm/config '@{MaxEnvelopeSizekb = "8192"}'
 
-
-# Configure WinRM listener
-Configure-WinRMListener
+# Configure https listener
+Configure-WinRMHttpsListener $HostName $port
 
 # Add firewall exception
-Add-FirewallException
-
-# List the listeners
-Write-Verbose -Verbose "Listing the WinRM listeners:"
-
-Write-Verbose -Verbose "Querying WinRM listeners by running command: winrm enumerate winrm/config/listener"
-winrm enumerate winrm/config/listener
+Add-FirewallException -port $winrmHttpsPort
 
 #################################################################################################################################
 #################################################################################################################################
